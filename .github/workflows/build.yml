@@ -38,6 +38,7 @@ on:
         default: "true"
         options:
           - "true"
+          - "false"
 
   schedule:
     # Weekly Monday 02:00 UTC
