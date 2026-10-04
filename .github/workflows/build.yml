@@ -75,7 +75,7 @@ jobs:
           # otherwise get a workspace without config/ and fail at
           # "Apply default config".
           # Drop this line once config/ lives on the default branch.
-          ref: test
+          # ref: test
 
       - name: Verify repo layout
         run: |
