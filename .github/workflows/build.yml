@@ -11,11 +11,11 @@ name: build-v50-firmware
 on:
   workflow_dispatch:
     inputs:
-      release_tag: 
+      release_tag:
         description: "Release tag (blank -> nightly-<UTC timestamp>)."
         required: false
         default: ""
-      openwrt_version: 
+      openwrt_version:
         description: "OpenWrt tag to build (e.g. v25.12.5)."
         required: false
         default: "v25.12.5"
@@ -30,7 +30,9 @@ on:
           Space-separated package names to disable from config/default.config.
           Example: "luci-app-nikki luci-app-ua3f hiddify-core".
         required: true
-        default: " luci-app-passwall2,luci-theme-aurora"
+        # NOTE: space-separated. A comma-separated value used to slip through as
+        # a single "package name" and silently remove nothing.
+        default: "luci-app-passwall2 luci-theme-aurora"
       prerelease:
         description: "Mark the new release as a pre-release?"
         required: false
@@ -52,9 +54,44 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360   # 6h headroom; full -j1 build is ~2-4h
 
+    env:
+      # `schedule` runs carry no `inputs` context, so every input gets a
+      # fallback here (an empty openwrt_version would make the wget below fetch
+      # ".../refs/tags/" and fail immediately). Passing inputs through env also
+      # keeps user-supplied text out of the generated shell script.
+      OPENWRT_VERSION: ${{ inputs.openwrt_version || 'v25.12.5' }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ADD_PACKAGES: ${{ inputs.add_packages }}
+      REMOVE_PACKAGES: ${{ inputs.remove_packages }}
+      PRERELEASE: ${{ inputs.prerelease || 'true' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # config/ only exists on the `test` branch, so pin the ref the
+          # workspace is built from: a manual run started from another branch,
+          # or the scheduled run (which always uses the default branch), would
+          # otherwise get a workspace without config/ and fail at
+          # "Apply default config".
+          # Drop this line once config/ lives on the default branch.
+          ref: test
+
+      - name: Verify repo layout
+        run: |
+          echo "ref=${{ github.ref }}  event=${{ github.event_name }}  sha=${{ github.sha }}"
+          echo "workspace=$GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE"
+          missing=0
+          for f in config/default.config config/feeds.conf; do
+            if [ -f "$GITHUB_WORKSPACE/$f" ]; then
+              echo "OK   $f ($(stat -c%s "$GITHUB_WORKSPACE/$f") bytes)"
+            else
+              echo "::error::$f is missing from the workspace"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
 
       - name: Show disk + memory
         run: |
@@ -79,9 +116,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ inputs.openwrt_version }}-${{ github.run_id }}
+          # run_id in the key keeps saving a fresh cache every run (a fixed key
+          # would stop updating once it hits); restore-keys picks up the most
+          # recent one for this version.
+          key: ccache-${{ env.OPENWRT_VERSION }}-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ inputs.openwrt_version }}-
+            ccache-${{ env.OPENWRT_VERSION }}-
             ccache-
 
       - name: Configure ccache
@@ -101,14 +141,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: openwrt-dl-${{ inputs.openwrt_version }}
+          key: openwrt-dl-${{ env.OPENWRT_VERSION }}
           restore-keys: |
             openwrt-dl-
 
       - name: Download OpenWrt source
         run: |
           set -e
-          wget -q "https://codeload.github.com/openwrt/openwrt/tar.gz/refs/tags/${{ inputs.openwrt_version }}" \
+          wget -q "https://codeload.github.com/openwrt/openwrt/tar.gz/refs/tags/${OPENWRT_VERSION}" \
             -O openwrt.tar.gz
           mkdir -p openwrt
           tar xzf openwrt.tar.gz -C openwrt --strip-components=1
@@ -126,7 +166,23 @@ jobs:
           cp feeds.conf.default feeds.conf
           echo '' >> feeds.conf
           echo '# --- appended by openwrt-v50-builder (config/feeds.conf) ---' >> feeds.conf
-          grep -v '^#' ../config/feeds.conf | grep -v '^$' >> feeds.conf || true
+
+          # Explicit check: the old `... || true` here swallowed the same
+          # missing-config error that later blew up in "Apply default config".
+          FEEDS_CONF="$GITHUB_WORKSPACE/config/feeds.conf"
+          if [ ! -f "$FEEDS_CONF" ]; then
+            echo "::error::$FEEDS_CONF is missing — check the run's ref / checkout settings."
+            ls -la "$GITHUB_WORKSPACE"
+            ls -la "$GITHUB_WORKSPACE/config" || true
+            exit 1
+          fi
+
+          before=$(wc -l < feeds.conf)
+          # `|| true` stays only for the corner case where every line of
+          # config/feeds.conf is a comment (grep -v then exits 1).
+          grep -v '^#' "$FEEDS_CONF" | grep -v '^$' >> feeds.conf || true
+          after=$(wc -l < feeds.conf)
+          echo "config/feeds.conf contributed $((after - before)) line(s)"
           echo '=== feeds.conf ==='
           cat feeds.conf
 
@@ -136,31 +192,43 @@ jobs:
       - name: Apply default config + user inputs
         run: |
           set -e
-          cd openwrt
-          cp ../config/default.config .config
-          echo "Default config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config) packages enabled"
+          CFG="$GITHUB_WORKSPACE/config/default.config"
+          if [ ! -f "$CFG" ]; then
+            echo "::error::$CFG is missing — check the run's ref / checkout settings."
+            ls -la "$GITHUB_WORKSPACE"
+            ls -la "$GITHUB_WORKSPACE/config" || true
+            exit 1
+          fi
+          cp "$CFG" openwrt/.config
+          echo "Default config: $(grep -c '^CONFIG_PACKAGE_.*=y' openwrt/.config) packages enabled"
 
-          if [ -n "${{ inputs.add_packages }}" ]; then
-            echo "Adding: ${{ inputs.add_packages }}"
-            for pkg in ${{ inputs.add_packages }}; do
-              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          if [ -n "$ADD_PACKAGES" ]; then
+            echo "Adding: $ADD_PACKAGES"
+            # word splitting is intended here
+            for pkg in $ADD_PACKAGES; do
+              echo "CONFIG_PACKAGE_${pkg}=y" >> openwrt/.config
             done
           fi
 
-          if [ -n "${{ inputs.remove_packages }}" ]; then
-            echo "Removing: ${{ inputs.remove_packages }}"
-            for pkg in ${{ inputs.remove_packages }}; do
-              sed -i "s/^CONFIG_PACKAGE_${pkg}=y/# CONFIG_PACKAGE_${pkg} is not set/" .config
+          if [ -n "$REMOVE_PACKAGES" ]; then
+            echo "Removing: $REMOVE_PACKAGES"
+            for pkg in $REMOVE_PACKAGES; do
+              if grep -q "^CONFIG_PACKAGE_${pkg}=y" openwrt/.config; then
+                sed -i "s/^CONFIG_PACKAGE_${pkg}=y/# CONFIG_PACKAGE_${pkg} is not set/" openwrt/.config
+                echo "  disabled $pkg"
+              else
+                echo "::warning::$pkg is not enabled in the config (typo, or not space-separated?)"
+              fi
             done
           fi
 
           # Resolve dependencies / fill in defaults
-          make defconfig
+          make -C openwrt defconfig
 
           echo "=== Final package count ==="
-          grep -c '^CONFIG_PACKAGE_.*=y' .config || true
+          grep -c '^CONFIG_PACKAGE_.*=y' openwrt/.config || true
           echo "=== Target summary ==="
-          grep '^CONFIG_TARGET_' .config | grep -v '^#' || true
+          grep '^CONFIG_TARGET_' openwrt/.config | grep -v '^#' || true
 
       - name: Build (single-threaded, verbose tail)
         run: |
@@ -216,8 +284,8 @@ jobs:
       - name: Resolve release tag
         id: tag
         run: |
-          if [ -n "${{ inputs.release_tag }}" ]; then
-            TAG="${{ inputs.release_tag }}"
+          if [ -n "$RELEASE_TAG" ]; then
+            TAG="$RELEASE_TAG"
           else
             TAG="nightly-$(date -u +%Y%m%d-%H%M%S)"
           fi
@@ -240,7 +308,7 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
-          prerelease: ${{ inputs.prerelease || 'true' }}
+          prerelease: ${{ env.PRERELEASE }}
           files: |
             openwrt-final.img
             openwrt-final.img.gz
@@ -248,10 +316,10 @@ jobs:
           body: |
             OpenWrt build from `${{ github.workflow }}` triggered by `${{ github.event_name }}`.
 
-            - OpenWrt source tag: `${{ inputs.openwrt_version }}`
-            - Base config: `config/default.config` (243 packages)
-            - Added packages: `${{ inputs.add_packages || '(none)' }}`
-            - Removed packages: `${{ inputs.remove_packages || '(none)' }}`
+            - OpenWrt source tag: `${{ env.OPENWRT_VERSION }}`
+            - Base config: `config/default.config`
+            - Added packages: `${{ env.ADD_PACKAGES || '(none)' }}`
+            - Removed packages: `${{ env.REMOVE_PACKAGES || '(none)' }}`
             - Build flags: `make -j1 V=s` (single-threaded)
 
             Files:
@@ -268,16 +336,13 @@ jobs:
         run: |
           {
             echo "## Build summary"
-            echo "- OpenWrt: \`${{ inputs.openwrt_version }}\`"
+            echo "- OpenWrt: \`$OPENWRT_VERSION\`"
             echo "- Tag: \`${{ steps.tag.outputs.tag }}\`"
-            echo "- Added: \`${{ inputs.add_packages }}\`"
-            echo "- Removed: \`${{ inputs.remove_packages }}\`"
+            echo "- Added: \`$ADD_PACKAGES\`"
+            echo "- Removed: \`$REMOVE_PACKAGES\`"
             if [ -f openwrt-final.img.gz ]; then
               echo "- Output: $(stat -c%s openwrt-final.img.gz | numfmt --to=iec)"
             else
               echo "- Output: NOT BUILT"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-
-
-          
