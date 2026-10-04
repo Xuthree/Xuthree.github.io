@@ -68,7 +68,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
+        # with:
           # config/ only exists on the `test` branch, so pin the ref the
           # workspace is built from: a manual run started from another branch,
           # or the scheduled run (which always uses the default branch), would
